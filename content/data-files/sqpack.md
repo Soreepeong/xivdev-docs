@@ -154,8 +154,9 @@ The actual `SqPackIndexHeader` is `0x400`bytes large, but for the purposes of th
 ```cpp
 struct IndexHashTableEntry
 {
-    uint64_t hash;
-    uint32_t unknown : 1;
+    uint32_t nameHash;
+    uint32_t pathHash;
+    uint32_t multipleItemsExist : 1;
     uint32_t dataFileId : 3;
     uint32_t offset : 28;
     uint32_t _padding;
@@ -168,13 +169,16 @@ struct IndexHashTableEntry
 [StructLayout( LayoutKind.Sequential )]
 public struct IndexHashTableEntry
 {
-    public UInt64 hash;
+    public UInt32 nameHash;
+    public UInt32 pathHash;
     public UInt32 data;
     private UInt32 _padding;
 
     public byte DataFileId => (byte) ( ( data & 0b1110 ) >> 1 );
 
     public uint Offset => (uint) ( data & ~0xF ) * 0x08;
+    
+    public bool MultipleItemsExist => (bool) (data & 1);
 }
 ```
 {% endtab %}
@@ -184,20 +188,23 @@ There's a couple notable differences between the C++ and C\# version, so we'll j
 
 The hash is a u64 that contains two u32s: the lower bits are the filename CRC32, the higher bits are the folder CRC32.
 
-Generally speaking, calculating a `hash` works like this:
+Generally speaking, calculating a pair of `nameHash` and `pathHash` works like this:
 
 1. Convert the path to lowercase 
 2. Find the last instance of `/` and split the string with the last `/` existing in the first group. The filename needs to have no directory separators
-3. Calculate the CRC32 of both path segments
-4. Join both CRC32s into a u64, eg. `directoryHash << 32 | filenameHash`
+3. Calculate the CRC32 of both path segments, and set `nameHash` to the value corresponding to file name and `pathHash` to the another.
+
+Note that the entries will be sorted by `pathHash` first, then by `nameHash`, enabling binary search.
 
 The `dataFileId` is to identify which file \(on disk\) contains the file. Larger categories are split across multiple files \(each is capped at 2,000,000,000 bytes, or 2 GB\), so this is used to distinguish between `020000.win32.dat0` and `020000.win32.dat1` for example, where `dataFileId` would be `0` and `1` respectively for files located in either dat.
 
 The `offset` is the absolute number of 8 byte aligned segments that the file is located at within a specific dat file. In a given dat file, a file is located at `offset * 0x8` which gives you the absolute offset to start reading a file from.
 
+If there are multiple files sharing same hash, `multipleItemsExist` bit will be set, and you will have to refer to the Hash Conflict Resolver segment.
+
 ### Reading Index2
 
-The main difference between `index` and `index2` is that the entire path is encoded into one CRC32 hash and does not split the path by folder and filename. Outside of that, everything is identical to `index`.
+The main difference between `index` and `index2` is that the entire path is encoded into one CRC32 hash and does not split the path by folder and filename, and thus all entries are sorted by one hash value only. Outside of that, everything is identical to `index`.
 
 {% tabs %}
 {% tab title="C++" %}
@@ -205,7 +212,7 @@ The main difference between `index` and `index2` is that the entire path is enco
 struct Index2HashTableEntry
 {
     uint32_t hash;
-    uint32_t unknown : 1;
+    uint32_t multipleItemsExist : 1;
     uint32_t dataFileId : 3;
     uint32_t offset : 28;
 };
@@ -223,10 +230,42 @@ public struct Index2HashTableEntry
     public byte DataFileId => (byte) ( ( data & 0b1110 ) >> 1 );
 
     public uint Offset => (uint) ( data & ~0xF ) * 0x08;
+    
+    public bool MultipleItemsExist => (bool) (data & 1);
 }
 ```
 {% endtab %}
 {% endtabs %}
 
+### Interpreting Hash Conflict Resolver Segment
 
+{% tabs %}
+{% tab title="C++" %}
+```cpp
+struct HashConflictSegmentEntry {
+    union {
+        struct {
+            // TODO: following two can actually be in reverse order; find it out when the game data file actually contains a conflict in a .index file
+            uint32_t name;
+            uint32_t path;
+        } index;
+        struct {
+            uint32_t full;
+            uint32_t unused;
+        } index2;
+    } hash;
+    uint32_t multipleItemsExist : 1;
+    uint32_t dataFileId : 3;
+    uint32_t offset : 28;
+    uint32_t conflictIndex;
+    char fullPath[0xF0];
+};
+```
+{% endtab %}
+{% endtabs %}
 
+The last item of this segment always contain 0xFFFFFFFF for all hash values and `conflictIndex`, and zero for all locator values. `conflictIndex` resets to zero every time hash pair changes. This segment also is sorted by hash values, so you can use binary search to search for an item efficiently.
+
+Currently, this section only exists for `.index2` files: `010000`, `020000`, `040000`, and `080000`.
+
+TODO
